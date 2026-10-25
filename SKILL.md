@@ -1,12 +1,13 @@
 ---
 name: claude-cowboy
-description: "Multi-agent orchestrator (a Claude Code port of pi-cowboy): split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode), each running in its own Herdr workspace and isolated in a copy-on-write Git worktree on its own branch; then steer, merge and clean them up. Use when the user invokes /claude-cowboy, asks for cowboy agents, or asks to launch parallel background agents in Herdr worktrees. Requires running inside Herdr (HERDR_ENV=1) in a Git repo."
+description: "Multi-agent orchestrator (a Claude Code port of pi-cowboy): split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode), each running in its own Herdr workspace and isolated in a copy-on-write Git worktree on its own branch; then steer them and, when the user says so, open PRs, merge and clean up. Use when the user invokes /claude-cowboy, asks for cowboy agents, or asks to launch parallel background agents in Herdr worktrees. Requires running inside Herdr (HERDR_ENV=1) in a Git repo."
 ---
 
 # claude-cowboy
 
 You are the orchestrator. You break work into focused subtasks, hand each to a background
-**cowboy agent**, collect their reports, review and merge their branches, and clean up.
+**cowboy agent**, collect their reports and review their branches. Merging, PRs and
+cleanup happen only when the user says so.
 
 Every operation goes through one helper CLI, `~/.claude/skills/claude-cowboy/scripts/cowboy`.
 Always call it by that literal path, never through a shell variable or alias, so the
@@ -86,7 +87,7 @@ A waiter can exit with these statuses:
   unless they have said to.
 - `exited`: the agent process died. Its pane output is included.
 
-### 3. Review, then steer or merge
+### 3. Review, steer, then report back
 
 - **Review** the work: `git -C <worktree> log -p <base>..HEAD`, or `git diff <base>...<branch>`
   from the main checkout.
@@ -96,16 +97,36 @@ A waiter can exit with these statuses:
   ~/.claude/skills/claude-cowboy/scripts/cowboy steer <id> [<id>…] -m "follow-up instructions"
   ```
 - **Stop** a runaway agent (interrupts it and keeps its worktree): `~/.claude/skills/claude-cowboy/scripts/cowboy stop <id>`
-- **Merge** settled branches into the main checkout. The checkout must be on the target
-  branch with no uncommitted tracked changes. The helper stops at the first conflict and
-  leaves it in place for you to resolve.
+- **Report** to the user once the work looks good: what changed, your review verdict, and
+  the branch and worktree path. Then **stop and wait**. Leave the worktree, branch and
+  Herdr workspace in place so the user can inspect it, and so you can keep steering the
+  agent if they want changes.
+
+### 4. Land the work (only when the user says so)
+
+**Never merge, push, open a PR or clean up on your own initiative**, even after a clean
+review. The user decides how the work lands. Don't assume a merge; ask if it's unclear.
+The two ways it lands:
+
+- **Pull request from the worktree** (often the preferred path). Push the agent's branch
+  and open the PR straight from its worktree, leaving the worktree open. Don't merge into
+  the main checkout.
+  ```bash
+  git -C <worktree> push -u origin <branch>
+  (cd <worktree> && gh pr create --base <base> --head <branch> --title "…" --body "…")
+  ```
+  If review feedback comes in, steer the agent and push again from the same worktree.
+- **Local merge** into the main checkout. The checkout must be on the target branch with
+  no uncommitted tracked changes. The helper stops at the first conflict and leaves it in
+  place for you to resolve.
   ```bash
   ~/.claude/skills/claude-cowboy/scripts/cowboy merge <branch-or-id> [...] [--target main]
   ```
 
-### 4. Clean up
+### 5. Clean up (only when the user says so)
 
-Clean up each agent once its branch is merged or rejected:
+Clean up an agent only when the user asks, typically after its branch is merged (locally
+or via a merged PR) or rejected:
 
 ```bash
 ~/.claude/skills/claude-cowboy/scripts/cowboy cleanup <id> [<id>…]
@@ -181,6 +202,8 @@ template's `model`, then `agent.model`, then the harness's own default.
 - Don't do a subtask yourself while an agent owns it, and don't edit an agent's worktree.
   Steer the agent instead.
 - Give parallel agents non-overlapping files where you can, so merges stay clean.
+- Merging, pushing, opening a PR and cleaning up each need the user's explicit go-ahead.
+  A good review is not permission to land the work.
 - Read reports critically and check the diff before merging. A report is the agent's
   claim, not proof.
 - Never close Herdr workspaces you didn't create. Cleanup closes only the agent's own.

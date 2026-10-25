@@ -4,7 +4,7 @@
 
 A [Claude Code](https://claude.com/claude-code) skill for multi-agent orchestration — a Claude Code port of pi-cowboy.
 
-Split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode). Each agent runs in its own Herdr workspace, isolated in a copy-on-write Git worktree on its own branch. The orchestrator then steers, reviews, merges and cleans them up.
+Split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode). Each agent runs in its own Herdr workspace, isolated in a copy-on-write Git worktree on its own branch. The orchestrator then steers and reviews them, and lands the work (as a PR or a local merge) when you say so.
 
 See [`SKILL.md`](SKILL.md) for full usage.
 
@@ -35,7 +35,7 @@ Start Claude Code inside a Herdr pane, in a Git repo, and hand it a job:
 /claude-cowboy add input validation to every API handler, and write tests for each
 ```
 
-Claude acts as the orchestrator. It breaks the job into focused subtasks and spawns one background agent for each. Every agent gets its own branch (`cow-<slug>-<id>`), its own copy-on-write worktree and its own Herdr workspace. When agents finish, Claude reads their reports, reviews the diffs, merges what's good and cleans up. You can open any agent's Herdr workspace to watch it or step in.
+Claude acts as the orchestrator. It breaks the job into focused subtasks and spawns one background agent for each. Every agent gets its own branch (`cow-<slug>-<id>`), its own copy-on-write worktree and its own Herdr workspace. When agents finish, Claude reads their reports, reviews the diffs and reports back. Nothing is merged, pushed or cleaned up until you say so. You can open any agent's Herdr workspace to watch it or step in.
 
 ### Slash command shortcuts
 
@@ -58,8 +58,9 @@ You can also just ask in plain language, e.g. "spin up cowboy agents to migrate 
 2. **Wait.** A background waiter per agent tells Claude when the agent settles, so nothing polls.
 3. **Review / steer.** Claude checks each diff. If work needs another pass, Claude *steers* the agent with follow-up instructions in its existing pane.
 4. **Blocked agents.** If an agent needs a decision (or is stuck at a dialog), Claude passes the question to you and won't approve anything on your behalf unless you've said it can.
-5. **Merge.** Settled branches merge into your main checkout. The checkout must be on the target branch and clean. A conflict stops the merge and leaves it for you to resolve.
-6. **Clean up.** Closes the agent's workspace, removes the worktree and deletes the branch if it's merged. Anything that would throw away work (uncommitted changes, unmerged branches) needs your explicit OK.
+5. **Report.** Claude summarizes the work and stops. The worktree, branch and Herdr workspace stay open so you can inspect it or ask for changes.
+6. **Land (on your say-so).** Either push the branch and open a pull request straight from the agent's worktree (the worktree stays open for review follow-ups), or merge it into your main checkout. A local merge needs the checkout on the target branch and clean; a conflict stops the merge and leaves it for you to resolve.
+7. **Clean up (on your say-so).** Closes the agent's workspace, removes the worktree and deletes the branch if it's merged. Anything that would throw away work (uncommitted changes, unmerged branches) needs your explicit OK.
 
 ### Picking a harness, model or role
 
