@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 16" width="288" height="256" shape-rendering="crispEdges">
+  <!-- body, arms, legs -->
+  <g fill="#D97757">
+    <rect x="3" y="5" width="12" height="8"/>
+    <rect x="1" y="9" width="16" height="2"/>
+    <rect x="3" y="13" width="1" height="2"/>
+    <rect x="5" y="13" width="1" height="2"/>
+    <rect x="12" y="13" width="1" height="2"/>
+    <rect x="14" y="13" width="1" height="2"/>
+  </g>
+  <!-- eyes -->
+  <g fill="#000000">
+    <rect x="5" y="7" width="1" height="2"/>
+    <rect x="12" y="7" width="1" height="2"/>
+  </g>
+  <!-- hat: dented crown, upturned brim -->
+  <g fill="#8B5A2B">
+    <rect x="6" y="1" width="2" height="1"/>
+    <rect x="10" y="1" width="2" height="1"/>
+    <rect x="5" y="2" width="8" height="2"/>
+    <rect x="1" y="4" width="1" height="1"/>
+    <rect x="16" y="4" width="1" height="1"/>
+    <rect x="1" y="5" width="16" height="1"/>
+  </g>
+  <rect x="5" y="4" width="8" height="1" fill="#4A2E14"/>
+</svg>

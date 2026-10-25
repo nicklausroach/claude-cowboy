@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="claude-cowboy logo" width="160"></p>
+
 # claude-cowboy
 
 A [Claude Code](https://claude.com/claude-code) skill for multi-agent orchestration — a Claude Code port of pi-cowboy.
