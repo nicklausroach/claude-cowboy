@@ -1,0 +1,6 @@
+name = "review-before-commit"
+description = "Every agent reviews its own diff for bugs before committing."
+guidance = '''
+Before you commit, review your full diff (git diff) as a skeptical reviewer would: look
+for correctness bugs, missed edge cases and leftover debug code. Fix what you find, then
+commit. Mention the review in your report.'''

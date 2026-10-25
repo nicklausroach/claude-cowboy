@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""claude-cowboy: run background coding agents in Herdr panes, each isolated in a
+copy-on-write Git worktree. A Claude Code port of pi-cowboy.
+
+State lives in $CLAUDE_COWBOY_HOME (default ~/.claude/claude-cowboy):
+  config.json            optional settings (see SKILL.md)
+  agents/*.toml          user agent templates (override the bundled ones)
+  orchestrators/*.toml   user orchestrator templates
+  state/<id>.json        one record per agent
+  state/<id>/            prompt, system prompt and report files
+  worktrees/<branch>/    agent worktrees
+"""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import random
+import re
+import shutil
+import string
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
+HOME = Path(os.environ.get("CLAUDE_COWBOY_HOME", Path.home() / ".claude" / "claude-cowboy"))
+STATE = HOME / "state"
+WORKTREES = HOME / "worktrees"
+SKILL_DIR = Path(__file__).resolve().parent.parent
+HARNESSES = ("claude", "codex", "pi", "opencode")
+ACTIVE = ("running", "blocked")
+SETTLED = ("settled", "blocked", "stopped", "exited")
+POLL = 4
+
+DEFAULT_CONFIG = {
+    "concurrency": {"default": 4, "harnesses": {}, "models": {}},
+    "agent": {
+        "harness": "claude",
+        "template": "general-purpose",
+        "model": None,
+        "effort": None,
+        # "bypass" = --dangerously-skip-permissions (what pi-cowboy does); any other
+        # value is passed to claude as --permission-mode.
+        "permission_mode": "bypass",
+        # "cow" (copy-on-write clone incl. ignored files) or "checkout" (plain worktree)
+        "worktree_materialization": "cow",
+        "base_branch": None,
+    },
+    "orchestrator": None,
+    # Tail of `herdr agent wait` idle time (seconds) after which an agent that never
+    # wrote a report is treated as settled.
+    "idle_grace_seconds": 45,
+    # Claude Code asks "do you trust this folder?" for each new worktree path.
+    # "inherit": accept it when the main repo (or an ancestor) is already trusted;
+    # "always": always accept; "never": leave the dialog for you to answer.
+    "auto_trust": "inherit",
+}
+
+
+class CowboyError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def die(msg):
+    print(f"✗ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, cwd=None, check=True, input=None):
+    p = subprocess.run(cmd, cwd=cwd, input=input, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise CowboyError(f"{' '.join(map(str, cmd[:4]))}… failed: {(p.stderr or p.stdout).strip()[:400]}")
+    return p
+
+
+def git(args, cwd, check=True):
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+def herdr(args, check=True):
+    p = run(["herdr", *args], check=False)
+    if check and p.returncode != 0:
+        raise CowboyError(f"herdr {' '.join(args[:3])} failed: {(p.stderr or p.stdout).strip()[:400]}")
+    try:
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {"raw": p.stdout, "returncode": p.returncode, "stderr": p.stderr}
+
+
+def deep_merge(base, over):
+    out = dict(base)
+    for k, v in (over or {}).items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load_config():
+    path = HOME / "config.json"
+    user = json.loads(path.read_text()) if path.exists() else {}
+    return deep_merge(DEFAULT_CONFIG, user)
+
+
+def slugify(text, limit=24):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (s[:limit].rstrip("-")) or "task"
+
+
+def new_id():
+    alphabet = string.ascii_lowercase + string.digits
+    while True:
+        i = "".join(random.choice(alphabet) for _ in range(8))
+        if not (STATE / f"{i}.json").exists():
+            return i
+
+
+@contextlib.contextmanager
+def lock():
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / ".lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def load(agent_id):
+    path = STATE / f"{agent_id}.json"
+    if not path.exists():
+        raise CowboyError(f"unknown agent id {agent_id}")
+    return json.loads(path.read_text())
+
+
+def save(agent):
+    agent["updated_at"] = time.time()
+    tmp = STATE / f".{agent['id']}.json.tmp"
+    tmp.write_text(json.dumps(agent, indent=2))
+    tmp.replace(STATE / f"{agent['id']}.json")
+
+
+def all_agents():
+    if not STATE.exists():
+        return []
+    agents = [json.loads(p.read_text()) for p in STATE.glob("*.json")]
+    return sorted(agents, key=lambda a: a["created_at"])
+
+
+def agent_dir(agent):
+    d = STATE / agent["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def repo_root(path):
+    p = git(["rev-parse", "--show-toplevel"], cwd=path, check=False)
+    if p.returncode != 0:
+        raise CowboyError(f"{path} is not inside a git repository")
+    return p.stdout.strip()
+
+
+def require_herdr():
+    if os.environ.get("HERDR_ENV") != "1":
+        raise CowboyError("not running inside a Herdr pane (HERDR_ENV != 1); start Claude Code inside Herdr first")
+    if not shutil.which("herdr"):
+        raise CowboyError("herdr is not on PATH")
+
+
+# ---------------------------------------------------------------- templates
+
+def _load_toml(path):
+    if tomllib is None:
+        raise CowboyError("reading templates needs Python 3.11+ (tomllib) or the tomli package")
+    with open(path, "rb") as fh:
+        return tomllib.load(fh)
+
+
+def find_templates(kind):
+    """Bundled first, then user overrides (by file stem and by name)."""
+    found = {}
+    for d in (SKILL_DIR / kind, HOME / kind):
+        if d.is_dir():
+            for f in sorted(d.glob("*.toml")):
+                data = _load_toml(f)
+                data["_path"] = str(f)
+                name = data.get("name", f.stem)
+                found[name.lower()] = data
+                found.setdefault(f.stem.lower(), data)
+    return found
+
+
+def get_template(kind, name):
+    if not name:
+        return {}
+    templates = find_templates(kind)
+    key = name.lower().replace(" ", "-")
+    t = templates.get(key) or templates.get(name.lower())
+    if t is None:
+        names = sorted({v.get("name", k) for k, v in templates.items()})
+        raise CowboyError(f"no {kind[:-1]} template named {name!r} (have: {', '.join(names) or 'none'})")
+    return t
+
+
+# ---------------------------------------------------------------- worktrees
+
+def materialize_worktree(repo, branch, path, base, mode, include_dirty):
+    """Create `path` on new branch `branch` from `base`. In "cow" mode the main
+    checkout (tracked + untracked + ignored files) is cloned with copy-on-write, then
+    tracked files are reset to `base`, so build caches and node_modules come along
+    for (almost) free."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], repo, check=False).returncode == 0:
+        raise CowboyError(f"branch {branch} already exists")
+
+    if mode == "cow" and sys.platform in ("darwin", "linux"):
+        git(["worktree", "add", "--no-checkout", "-b", branch, str(path), base], repo)
+        try:
+            cp = ["cp", "-c", "-R", "-P"] if sys.platform == "darwin" else ["cp", "--reflink=always", "-R", "-P"]
+            for entry in os.listdir(repo):
+                if entry == ".git":
+                    continue
+                run([*cp, os.path.join(repo, entry), str(path / entry)])
+            if include_dirty:
+                git(["reset", "-q", base], path)  # index = base, files keep main's dirty state
+            else:
+                git(["reset", "-q", "--hard", base], path)
+                git(["clean", "-fdq"], path)  # drop untracked WIP, keep ignored files
+            return "cow"
+        except CowboyError as e:
+            git(["worktree", "remove", "--force", str(path)], repo, check=False)
+            git(["branch", "-D", branch], repo, check=False)
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"! copy-on-write clone failed ({e}); falling back to a plain checkout", file=sys.stderr)
+
+    git(["worktree", "add", "-b", branch, str(path), base], repo)
+    return "checkout"
+
+
+# ---------------------------------------------------------------- launching
+
+COWBOY_RULES = """\
+# You are a cowboy agent
+
+You were spawned by an orchestrating coding session to do ONE focused task. You run
+in the background; nobody is watching your terminal, so do not wait for input.
+
+- Agent id: {id}
+- Your worktree (work ONLY here): {worktree}
+- Your branch: {branch} (created from {base})
+- Main checkout (do NOT modify it): {repo}
+
+Rules:
+1. Stay inside your worktree. Do not push, do not switch branches, do not touch other worktrees.
+2. Keep to the task. Do not expand scope; note follow-ups in your report instead.
+3. When you are finished, commit all of your changes to {branch} with a clear message
+   (skip the commit if the task made no file changes).
+4. LAST, write your final report as Markdown to:
+       {report}
+   Include: what you did, files changed, how you verified it, and anything left open.
+   Writing this file is the signal that you are done, so write it only at the very end.
+5. If you are blocked on a decision only a human can make, write the report anyway with
+   a first line of `BLOCKED: <question>` and stop. The orchestrator can steer you with
+   follow-up messages; when it does, do the follow-up and write the report again.
+"""
+
+
+def build_system_prompt(agent, template, orchestrator):
+    parts = [COWBOY_RULES.format(**agent)]
+    if orchestrator.get("guidance"):
+        parts.append("# Orchestrator guidance\n\n" + orchestrator["guidance"].strip())
+    if template.get("system_prompt"):
+        parts.append("# Role\n\n" + template["system_prompt"].strip())
+    return "\n\n".join(parts) + "\n"
+
+
+def harness_args(agent, cfg, template, sysprompt_file):
+    h = agent["harness"]
+    bypass = cfg["agent"]["permission_mode"] == "bypass"
+    model, effort = agent.get("model"), agent.get("effort")
+    hcfg = (template.get("harness") or {}).get(h, {})
+    if h == "claude":
+        args = ["--append-system-prompt-file", str(sysprompt_file), "-n", f"cow-{agent['id']} {agent['task_name']}"]
+        args += ["--dangerously-skip-permissions"] if bypass else ["--permission-mode", cfg["agent"]["permission_mode"]]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
+        if hcfg.get("tools"):
+            args += ["--tools", ",".join(hcfg["tools"])]
+        if hcfg.get("exclude_tools"):
+            args += ["--disallowedTools", ",".join(hcfg["exclude_tools"])]
+        return args
+    if h == "codex":
+        args = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else []
+        return args + (["-m", model] if model else [])
+    if h in ("pi", "opencode"):
+        return ["--model", model] if model else []
+    raise CowboyError(f"unknown harness {h}")
+
+
+def task_message(agent, sysprompt_file):
+    """Claude gets the rules through its system prompt; other harnesses get them inline."""
+    prompt = Path(agent["prompt_file"]).read_text()
+    if agent["harness"] == "claude":
+        return f"{prompt.strip()}\n\n(When done: commit, then write your report to {agent['report']}.)"
+    return f"{Path(sysprompt_file).read_text()}\n\n# Your task\n\n{prompt.strip()}"
+
+
+def repo_is_trusted(repo):
+    try:
+        projects = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {})
+    except (OSError, json.JSONDecodeError):
+        return False
+    p = Path(repo).resolve()
+    return any(projects.get(str(q), {}).get("hasTrustDialogAccepted") for q in (p, *p.parents))
+
+
+def answer_trust_dialog(agent, cfg):
+    """Accept Claude Code's folder-trust dialog for the worktree if policy allows.
+    Returns True when the dialog was answered and the agent became ready."""
+    policy = cfg.get("auto_trust", "inherit")
+    if agent["harness"] != "claude" or policy == "never":
+        return False
+    if policy == "inherit" and not repo_is_trusted(agent["repo"]):
+        return False
+    if "trust this folder" not in pane_tail(agent, 60):
+        return False
+    herdr(["agent", "send-keys", agent["herdr_name"], "down", "enter"], check=False)
+    r = run(["herdr", "agent", "wait", agent["herdr_name"], "--until", "idle", "--timeout", "30000"], check=False)
+    return r.returncode == 0 and "trust this folder" not in pane_tail(agent, 15)
+
+
+def launch(agent, cfg):
+    template = get_template("agents", agent.get("template"))
+    orchestrator = get_template("orchestrators", cfg.get("orchestrator"))
+    d = agent_dir(agent)
+    sysprompt_file = d / "system.md"
+    sysprompt_file.write_text(build_system_prompt(agent, template, orchestrator))
+
+    # `worktree open` registers the workspace as a linked worktree of the main repo, so
+    # Herdr groups it with the repo's primary workspace (and `close --group` covers it).
+    label = f"🐄 {agent['task_name']} ({agent['id']})"
+    r = run(["herdr", "worktree", "open", "--cwd", agent["repo"], "--path", agent["worktree"],
+             "--label", label, "--no-focus"], check=False)
+    try:
+        ws = json.loads(r.stdout)["result"]
+        ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        print(f"! herdr worktree open failed ({(r.stderr or r.stdout).strip()[:200]}); "
+              f"using an unlinked workspace", file=sys.stderr)
+        ws = herdr(["workspace", "create", "--cwd", agent["worktree"], "--label", label, "--no-focus"])["result"]
+    agent["workspace_id"] = ws["workspace"]["workspace_id"]
+    agent["pane_id"] = ws["root_pane"]["pane_id"]
+    agent["herdr_name"] = f"cow-{agent['id']}"
+    save(agent)
+
+    args = harness_args(agent, cfg, template, sysprompt_file)
+    last = None
+    for _ in range(5):  # the new shell may need a moment to reach its prompt
+        p = run(["herdr", "agent", "start", agent["herdr_name"], "--kind", agent["harness"],
+                 "--pane", agent["pane_id"], "--timeout", "60000", "--", *args], check=False)
+        if p.returncode == 0:
+            break
+        last = (p.stderr or p.stdout).strip()
+        if "agent_not_ready" in last:
+            if answer_trust_dialog(agent, cfg):
+                break
+            agent["status"] = "blocked"
+            agent["note"] = (f"agent is blocked at startup (folder-trust or permissions dialog); answer it in "
+                             f"Herdr workspace {agent['workspace_id']}, then `cowboy steer {agent['id']} -m go`")
+            save(agent)
+            return agent
+        time.sleep(2)
+    else:
+        agent["status"] = "exited"
+        agent["note"] = f"agent failed to start: {last[:300]}"
+        save(agent)
+        return agent
+
+    herdr(["agent", "prompt", agent["herdr_name"], task_message(agent, sysprompt_file)])
+    agent["prompted"] = True
+    agent["status"] = "running"
+    agent["started_at"] = time.time()
+    save(agent)
+    return agent
+
+
+def fits(agent, cfg, running):
+    c = cfg["concurrency"]
+    if len(running) >= int(c.get("default", 4)):
+        return False
+    hl = c.get("harnesses", {}).get(agent["harness"])
+    if hl is not None and sum(a["harness"] == agent["harness"] for a in running) >= hl:
+        return False
+    ml = c.get("models", {}).get(agent.get("model") or "")
+    if ml is not None and sum(a.get("model") == agent.get("model") for a in running) >= ml:
+        return False
+    return True
+
+
+def pump(cfg=None):
+    """Start queued agents (oldest first) that fit every concurrency limit."""
+    cfg = cfg or load_config()
+    started = []
+    with lock():
+        agents = all_agents()
+        running = [a for a in agents if a["status"] in ACTIVE]
+        for a in agents:
+            if a["status"] == "queued" and fits(a, cfg, running):
+                launch(a, cfg)
+                running.append(a)
+                started.append(a)
+    for a in started:
+        print(f"✓ Started queued agent {a['id']} ({a['task_name']}) → {a['status']}")
+    return started
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_spawn(args):
+    require_herdr()
+    cfg = load_config()
+    template = get_template("agents", args.template or cfg["agent"]["template"])
+    if args.prompt_file:
+        prompt = Path(args.prompt_file).read_text()
+    elif args.prompt == "-":
+        prompt = sys.stdin.read()
+    else:
+        prompt = args.prompt
+    if not prompt or not prompt.strip():
+        raise CowboyError("empty prompt")
+
+    harness = args.harness or template.get("harness_type") or cfg["agent"]["harness"]
+    if harness not in HARNESSES:
+        raise CowboyError(f"harness must be one of {', '.join(HARNESSES)}")
+    if not shutil.which(harness):
+        raise CowboyError(f"harness {harness!r} is not installed on PATH")
+    hcfg = (template.get("harness") or {}).get(harness, {})
+
+    repo = repo_root(args.repo or os.getcwd())
+    base = args.base or cfg["agent"]["base_branch"] or git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+    aid = new_id()
+    slug = slugify(args.task_name)
+    branch = f"cow-{slug}-{aid}"
+    worktree = WORKTREES / branch
+
+    mode = materialize_worktree(repo, branch, worktree, base,
+                                cfg["agent"]["worktree_materialization"], args.include_dirty)
+    agent = {
+        "id": aid, "task_name": args.task_name, "branch": branch, "worktree": str(worktree),
+        "repo": repo, "base": base, "harness": harness,
+        "template": template.get("name") if template else None,
+        "model": args.model or hcfg.get("model") or template.get("model") or cfg["agent"]["model"],
+        "effort": args.effort or hcfg.get("effort") or template.get("effort") or cfg["agent"]["effort"],
+        "status": "queued", "materialization": mode, "created_at": time.time(), "turn": 1,
+    }
+    d = agent_dir(agent)
+    agent["prompt_file"] = str(d / "prompt.md")
+    agent["report"] = str(d / "report.md")
+    Path(agent["prompt_file"]).write_text(prompt)
+    save(agent)
+
+    pump(cfg)
+    agent = load(aid)
+    word = "Queued" if agent["status"] == "queued" else "Spawned"
+    print(f"✓ {word} agent {aid} ({agent['template'] or 'no template'}, {harness}"
+          f"{', ' + agent['model'] if agent['model'] else ''}) status={agent['status']}")
+    print(f"  branch {branch}  worktree {worktree} ({mode})")
+    if agent.get("note"):
+        print(f"  note: {agent['note']}")
+    print(f"  → run `cowboy wait {aid}` in the background to be notified when it settles")
+
+
+def herdr_state(agent):
+    if not agent.get("herdr_name"):
+        return None
+    r = herdr(["agent", "get", agent["herdr_name"]], check=False)
+    res = r.get("result") if isinstance(r, dict) else None
+    if not res:
+        return "gone"
+    a = res.get("agent", res)
+    return a.get("agent_status") or a.get("status") or a.get("state")
+
+
+def pane_tail(agent, lines=40):
+    if not agent.get("pane_id"):
+        return ""
+    p = run(["herdr", "pane", "read", agent["pane_id"], "--source", "recent-unwrapped",
+             "--lines", str(lines)], check=False)
+    try:
+        r = json.loads(p.stdout)["result"]
+        return r.get("text") or r.get("content") or json.dumps(r)[:4000]
+    except Exception:
+        return p.stdout[-4000:]
+
+
+def check_settled(agent, cfg):
+    """Update agent status from its report file and herdr state. Returns True if settled."""
+    report = Path(agent["report"])
+    if agent["status"] == "running" and report.exists():
+        st = herdr_state(agent)
+        if st not in ("working",) or time.time() - report.stat().st_mtime > 30:
+            agent["status"] = "blocked" if report.read_text().lstrip().startswith("BLOCKED") else "settled"
+            agent["settled_at"] = time.time()
+            save(agent)
+            return True
+        return False
+    if agent["status"] in ("running", "blocked"):
+        st = herdr_state(agent)
+        if st == "gone":
+            agent["status"] = "exited"
+            agent["note"] = "agent process exited without writing a report"
+            save(agent)
+            return True
+        if st == "blocked":
+            if agent["status"] != "blocked":
+                agent["status"] = "blocked"
+                agent["note"] = "agent is waiting at an approval/question dialog in its pane"
+                save(agent)
+            return True
+        if st in ("idle", "done"):
+            idle_since = agent.setdefault("idle_since", time.time())
+            save(agent)
+            if time.time() - idle_since > cfg["idle_grace_seconds"]:
+                agent["status"] = "settled"
+                agent["note"] = "agent went idle without writing a report"
+                agent["settled_at"] = time.time()
+                save(agent)
+                return True
+        elif "idle_since" in agent:
+            agent.pop("idle_since")
+            save(agent)
+        if agent["status"] == "blocked" and st == "working":  # dialog was answered
+            agent["status"] = "running"
+            agent.pop("note", None)
+            save(agent)
+        return False
+    return agent["status"] in SETTLED
+
+
+def print_completion(agent):
+    status = agent["status"]
+    mark = "✓" if status == "settled" else "!"
+    print(f"{mark} [Cowboy agent {agent['id']} \"{agent['task_name']}\" {status}]")
+    if agent.get("note"):
+        print(f"  note: {agent['note']}")
+    print()
+    report = Path(agent["report"])
+    if report.exists():
+        print(report.read_text().strip())
+    else:
+        print("(no report file; last pane output follows)\n")
+        print(pane_tail(agent).strip())
+    ahead = git(["rev-list", "--count", f"{agent['base']}..{agent['branch']}"], agent["repo"], check=False).stdout.strip()
+    dirty = git(["status", "--porcelain"], agent["worktree"], check=False).stdout.strip()
+    print(f"\n(Worktree: {agent['worktree']} (branch {agent['branch']}, {ahead or '?'} commit(s) ahead of "
+          f"{agent['base']}{', HAS UNCOMMITTED CHANGES' if dirty else ''}). The agent and its Herdr workspace "
+          f"stay until `cowboy cleanup {agent['id']}`; steer it with `cowboy steer {agent['id']} -m ...`.)")
+    print()
+
+
+def cmd_wait(args):
+    cfg = load_config()
+    pending = list(dict.fromkeys(args.ids))
+    for i in pending:
+        load(i)
+    deadline = time.time() + args.timeout if args.timeout else None
+    while pending:
+        if any(load(i)["status"] == "queued" for i in pending):
+            pump(cfg)
+        done = []
+        for i in pending:
+            a = load(i)
+            if a["status"] in ("cleaned",):
+                done.append(i)
+                print(f"- agent {i} was cleaned up")
+            elif a["status"] != "queued" and check_settled(a, cfg):
+                done.append(i)
+                print_completion(load(i))
+        pending = [i for i in pending if i not in done]
+        if done:
+            pump(cfg)  # a slot opened: start the next queued agent
+            if args.any:
+                break
+        if pending:
+            if deadline and time.time() > deadline:
+                print(f"… timed out; still running: {', '.join(pending)}")
+                sys.exit(2)
+            time.sleep(POLL)
+
+
+def cmd_status(args):
+    cfg = load_config()
+    if not args.no_pump and os.environ.get("HERDR_ENV") == "1":
+        pump(cfg)
+    agents = [a for a in all_agents() if args.all or a["status"] != "cleaned"]
+    for a in agents:
+        if a["status"] in ACTIVE:
+            check_settled(a, cfg)
+    agents = [load(a["id"]) for a in agents]
+    if args.json:
+        print(json.dumps(agents, indent=2))
+        return
+    if not agents:
+        print("No cowboy agents.")
+        return
+    print(f"{'ID':9} {'STATUS':8} {'HARNESS':8} {'MODEL':12} {'AGE':>6}  TASK / BRANCH")
+    for a in agents:
+        age = int((time.time() - a["created_at"]) / 60)
+        print(f"{a['id']:9} {a['status']:8} {a['harness']:8} {(a.get('model') or '-')[:12]:12} {age:>5}m  "
+              f"{a['task_name']}  [{a['branch']}]")
+        if a.get("note") and a["status"] != "cleaned":
+            print(f"{'':9} note: {a['note']}")
+
+
+def cmd_steer(args):
+    require_herdr()
+    for i in args.ids:
+        a = load(i)
+        if a["status"] == "queued":
+            print(f"✗ {i}: queued agents have no pane yet and cannot be steered")
+            continue
+        if a["status"] == "cleaned":
+            print(f"✗ {i}: agent was cleaned up")
+            continue
+        if herdr_state(a) in (None, "gone"):
+            print(f"✗ {i}: agent process is gone; spawn a new agent instead")
+            continue
+        report = Path(a["report"])
+        if report.exists():
+            report.rename(report.with_name(f"report.turn{a.get('turn', 1)}.md"))
+        a["turn"] = a.get("turn", 1) + 1
+        msg = f"{args.message.strip()}\n\n(When done: commit, then write your report to {a['report']} again.)"
+        if not a.get("prompted"):  # blocked at startup: the task itself was never delivered
+            msg = f"{task_message(a, agent_dir(a) / 'system.md')}\n\n{args.message.strip()}"
+        r = run(["herdr", "agent", "prompt", a["herdr_name"], msg], check=False)
+        if r.returncode != 0:
+            print(f"✗ {i}: {(r.stderr or r.stdout).strip()[:300]}")
+            continue
+        a["status"] = "running"
+        a["prompted"] = True
+        a.pop("note", None)
+        a.pop("idle_since", None)
+        save(a)
+        print(f"✓ Steered {i}; run `cowboy wait {i}` in the background for its next report")
+
+
+def cmd_stop(args):
+    for i in args.ids:
+        a = load(i)
+        if a["status"] == "queued":
+            a["status"] = "stopped"
+            save(a)
+            print(f"✓ Dequeued {i}")
+            continue
+        if a.get("herdr_name") and herdr_state(a) not in (None, "gone"):
+            herdr(["agent", "send-keys", a["herdr_name"], "esc"], check=False)
+            time.sleep(0.5)
+            herdr(["agent", "send-keys", a["herdr_name"], "esc"], check=False)
+        a["status"] = "stopped"
+        save(a)
+        print(f"✓ Stopped {i} (worktree, branch and pane kept)")
+
+
+def cmd_merge(args):
+    repo = repo_root(args.repo or os.getcwd())
+    target = args.target or git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+    current = git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+    if current != target:
+        raise CowboyError(f"main checkout {repo} is on {current!r}, not {target!r}; switch to it first")
+    if git(["status", "--porcelain", "--untracked-files=no"], repo).stdout.strip():
+        raise CowboyError(f"main checkout {repo} has uncommitted changes; commit or stash them first")
+    by_branch = {a["branch"]: a for a in all_agents()}
+    for b in args.branches:
+        a = by_branch.get(b) or next((x for x in by_branch.values() if x["id"] == b), None)
+        branch = a["branch"] if a else b
+        if a and a["status"] in ("running", "queued"):
+            print(f"✗ {branch}: agent is still {a['status']}; wait for it to settle")
+            continue
+        if a and git(["status", "--porcelain"], a["worktree"], check=False).stdout.strip():
+            print(f"! {branch}: worktree has uncommitted changes that will NOT be merged")
+        p = git(["merge", "--no-ff", "--no-edit", branch], repo, check=False)
+        if p.returncode != 0:
+            print(f"✗ Merge of {branch} into {target} stopped with conflicts; resolve them in {repo} "
+                  f"(or `git merge --abort`). Remaining branches were not merged.\n{p.stdout.strip()[-1500:]}")
+            sys.exit(1)
+        print(f"✓ Merged {branch!r} into {target!r} in {os.path.basename(repo)}.")
+
+
+def cmd_cleanup(args):
+    for i in args.ids:
+        a = load(i)
+        if a["status"] == "cleaned":
+            print(f"- {i}: already cleaned")
+            continue
+        if a["status"] in ("running", "queued") and not args.force:
+            print(f"✗ {i}: agent is {a['status']}; stop it first (`cowboy stop {i}`)")
+            continue
+        out = [f"agent status: {a['status']}"]
+        if a.get("workspace_id"):
+            r = run(["herdr", "workspace", "close", a["workspace_id"]], check=False)
+            out.append("pane: closed" if r.returncode == 0 else f"pane: {(r.stderr or r.stdout).strip()[:120] or 'already gone'}")
+        wt_kept = False
+        if Path(a["worktree"]).exists():
+            dirty = git(["status", "--porcelain"], a["worktree"], check=False)
+            if dirty.returncode != 0 and not args.force:
+                wt_kept = True
+                out.append("worktree: kept — git status could not be read")
+            elif dirty.stdout.strip() and not args.force:
+                wt_kept = True
+                out.append(f"worktree: kept — uncommitted changes ({a['worktree']})")
+            else:
+                r = git(["worktree", "remove", "--force", a["worktree"]], a["repo"], check=False)
+                if r.returncode != 0:
+                    shutil.rmtree(a["worktree"], ignore_errors=True)
+                    git(["worktree", "prune"], a["repo"], check=False)
+                out.append(f"worktree: {'forced — removed with uncommitted changes' if dirty.stdout.strip() else 'removed'} ({a['worktree']})")
+        else:
+            out.append("worktree: already gone")
+        merged = git(["branch", "--merged", "HEAD", "--list", a["branch"]], a["repo"], check=False).stdout.strip()
+        exists = git(["show-ref", "--verify", "--quiet", f"refs/heads/{a['branch']}"], a["repo"], check=False).returncode == 0
+        if not exists:
+            out.append("branch: already gone")
+        elif wt_kept:
+            out.append(f"branch: kept ({a['branch']}) — worktree still uses it")
+        elif merged or args.delete_unmerged:
+            git(["branch", "-D", a["branch"]], a["repo"], check=False)
+            out.append(f"branch: deleted ({a['branch']}){'' if merged else ' — WAS NOT MERGED'}")
+        else:
+            out.append(f"branch: kept ({a['branch']}) — not merged into the main checkout's HEAD")
+        if not wt_kept:
+            a["status"] = "cleaned"
+            save(a)
+        print(f"✓ Cleaned up agent {i}:\n  " + "\n  ".join(out))
+    if os.environ.get("HERDR_ENV") == "1":
+        pump()
+
+
+def cmd_worktree(args):
+    cfg = load_config()
+    repo = repo_root(args.repo or os.getcwd())
+    base = args.base or git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+    branch = f"cow-{slugify(args.name)}-{new_id()[:6]}"
+    path = WORKTREES / branch
+    mode = materialize_worktree(repo, branch, path, base, cfg["agent"]["worktree_materialization"], args.include_dirty)
+    print(f"✓ Created worktree {path} on branch {branch} from {base} ({mode})")
+
+
+def cmd_templates(args):
+    for kind in ("agents", "orchestrators"):
+        print(f"{kind}:")
+        seen = set()
+        for t in find_templates(kind).values():
+            if t["_path"] in seen:
+                continue
+            seen.add(t["_path"])
+            print(f"  {t.get('name', Path(t['_path']).stem):20} {t.get('description', '')}  [{t['_path']}]")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.set:
+        path = HOME / "config.json"
+        user = json.loads(path.read_text()) if path.exists() else {}
+        for kv in args.set:
+            key, _, raw = kv.partition("=")
+            try:
+                val = json.loads(raw)
+            except json.JSONDecodeError:
+                val = raw
+            node = user
+            *parents, leaf = key.split(".")
+            for p in parents:
+                node = node.setdefault(p, {})
+            node[leaf] = val
+        HOME.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(user, indent=2) + "\n")
+        cfg = load_config()
+    print(json.dumps(cfg, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cowboy", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("spawn", help="spawn a background agent")
+    s.add_argument("--task-name", "-t", required=True, help="2-3 word name; used for branch/worktree/tab")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt", "-p", help="task instructions ('-' reads stdin)")
+    g.add_argument("--prompt-file", "-f")
+    s.add_argument("--template", "--agent-type", "-a")
+    s.add_argument("--harness", choices=HARNESSES)
+    s.add_argument("--model", "-m")
+    s.add_argument("--effort", "-e")
+    s.add_argument("--base", help="branch/ref to start from (default: current branch)")
+    s.add_argument("--repo", help="path inside the repo (default: cwd)")
+    s.add_argument("--include-dirty", action="store_true", help="carry the main checkout's uncommitted changes over")
+    s.set_defaults(fn=cmd_spawn)
+
+    s = sub.add_parser("wait", help="block until agents settle, then print their reports")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--any", action="store_true", help="return after the first one settles")
+    s.add_argument("--timeout", type=int, help="seconds")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("status", aliases=["st"], help="list agents")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true", help="include cleaned-up agents")
+    s.add_argument("--no-pump", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("steer", help="send a follow-up message (revives settled agents)")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--message", "-m", required=True)
+    s.set_defaults(fn=cmd_steer)
+
+    s = sub.add_parser("stop", help="interrupt agents, keeping their worktrees")
+    s.add_argument("ids", nargs="+")
+    s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("merge", help="merge agent branches into the main checkout")
+    s.add_argument("branches", nargs="+", help="branch names or agent ids")
+    s.add_argument("--target", help="default: main checkout's current branch")
+    s.add_argument("--repo")
+    s.set_defaults(fn=cmd_merge)
+
+    s = sub.add_parser("cleanup", help="close panes, remove worktrees, delete merged branches")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--force", action="store_true", help="also discard uncommitted worktree changes (ask the user first)")
+    s.add_argument("--delete-unmerged", action="store_true", help="also delete unmerged branches (ask the user first)")
+    s.set_defaults(fn=cmd_cleanup)
+
+    s = sub.add_parser("worktree", aliases=["wt"], help="create a cowboy worktree with no agent")
+    s.add_argument("name")
+    s.add_argument("--base")
+    s.add_argument("--repo")
+    s.add_argument("--include-dirty", action="store_true")
+    s.set_defaults(fn=cmd_worktree)
+
+    s = sub.add_parser("templates", help="list agent and orchestrator templates")
+    s.set_defaults(fn=cmd_templates)
+
+    s = sub.add_parser("config", help="show config, or --set key.path=value")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE")
+    s.set_defaults(fn=cmd_config)
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except CowboyError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
