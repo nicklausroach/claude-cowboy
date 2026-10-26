@@ -298,7 +298,8 @@ Rules:
    Writing this file is the signal that you are done, so write it only at the very end.
 5. If you are blocked on a decision only a human can make, write the report anyway with
    a first line of `BLOCKED: <question>` and stop. The orchestrator can steer you with
-   follow-up messages; when it does, do the follow-up and write the report again.
+   follow-up messages; when it does, do the follow-up and write the report again, to the
+   path that message gives (each turn has its own report file).
 """
 
 
@@ -535,9 +536,19 @@ def pane_tail(agent, lines=40):
 def check_settled(agent, cfg):
     """Update agent status from its report file and herdr state. Returns True if settled."""
     report = Path(agent["report"])
+    if agent["status"] == "settled":
+        if herdr_state(agent) != "working":
+            return True
+        agent["status"] = "running"  # it picked up more work, e.g. a steer queued mid-turn
+        agent.pop("settled_at", None)
+        agent.pop("note", None)
+        save(agent)
+        return False
     if agent["status"] == "running" and report.exists():
         st = herdr_state(agent)
-        if st not in ("working",) or time.time() - report.stat().st_mtime > 30:
+        # Never settle while herdr says working: the agent may already be on a queued
+        # follow-up. Fall back to the report's age only when herdr can't tell us.
+        if st in ("idle", "done", "blocked", "gone") or (st is None and time.time() - report.stat().st_mtime > 30):
             agent["status"] = "blocked" if report.read_text().lstrip().startswith("BLOCKED") else "settled"
             agent["settled_at"] = time.time()
             save(agent)
@@ -633,7 +644,7 @@ def cmd_status(args):
         pump(cfg)
     agents = [a for a in all_agents() if args.all or a["status"] != "cleaned"]
     for a in agents:
-        if a["status"] in ACTIVE:
+        if a["status"] in (*ACTIVE, "settled"):
             check_settled(a, cfg)
     agents = [load(a["id"]) for a in agents]
     if args.json:
@@ -664,12 +675,13 @@ def cmd_steer(args):
         if herdr_state(a) in (None, "gone"):
             print(f"✗ {i}: agent process is gone; spawn a new agent instead")
             continue
-        report = Path(a["report"])
-        if report.exists():
-            report.rename(report.with_name(f"report.turn{a.get('turn', 1)}.md"))
-        a["turn"] = a.get("turn", 1) + 1
-        msg = f"{args.message.strip()}\n\n(When done: commit, then write your report to {a['report']} again.)"
-        if not a.get("prompted"):  # blocked at startup: the task itself was never delivered
+        if a.get("prompted"):
+            # A fresh report file per turn, so a report the agent writes for the turn it is
+            # still finishing can't be mistaken for the answer to this message.
+            a["turn"] = a.get("turn", 1) + 1
+            a["report"] = str(agent_dir(a) / f"report.turn{a['turn']}.md")
+            msg = f"{args.message.strip()}\n\n(When done: commit, then write your report for this turn to {a['report']}.)"
+        else:  # blocked at startup: the task was never delivered, so this is still turn 1
             msg = f"{task_message(a, agent_dir(a) / 'system.md')}\n\n{args.message.strip()}"
         r = run([*HERDR, "agent", "prompt", a["herdr_name"], msg], check=False)
         if r.returncode != 0:

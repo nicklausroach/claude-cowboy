@@ -98,3 +98,11 @@ See [`SKILL.md`](SKILL.md) for the full reference, including every config key.
   - `CLAUDE_COWBOY_COORDINATED=1`: allow commands outside a Herdr pane, as long as a Herdr server is running on the machine.
   - `CLAUDE_COWBOY_HERDR_SESSION=<name>`: the Herdr session to use (default: `default`).
   - `HERDR_BIN=<path>`: the herdr binary, if it is not on `PATH` (`~/.local/bin/herdr` is also tried).
+
+## Tests
+
+The tests use only the standard library and mock Herdr, so they don't need a Herdr server. Run them from the repo root:
+
+```bash
+python3 -m unittest discover tests -v
+```
