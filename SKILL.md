@@ -44,6 +44,7 @@ test "${HERDR_ENV:-}" = 1 && git rev-parse --show-toplevel
 | `model <alias>` | `~/.claude/skills/claude-cowboy/scripts/cowboy config --set agent.model=<alias>` (`clear` sets it to `null`) |
 | `templates` | `~/.claude/skills/claude-cowboy/scripts/cowboy templates` |
 | `config` | `~/.claude/skills/claude-cowboy/scripts/cowboy config` |
+| `diff <id>` | `~/.claude/skills/claude-cowboy/scripts/cowboy diff <id>` |
 | anything else | Treat it as a job to break down and delegate |
 
 ## Workflow
@@ -89,8 +90,8 @@ A waiter can exit with these statuses:
 
 ### 3. Review, steer, then report back
 
-- **Review** the work: `git -C <worktree> log -p <base>..HEAD`, or `git diff <base>...<branch>`
-  from the main checkout.
+- **Review** the work: `~/.claude/skills/claude-cowboy/scripts/cowboy diff <id>` (commits since the base plus
+  any uncommitted changes; `--stat` for a summary), or `git diff <base>...<branch>` from the main checkout.
 - **Steer** if it needs another pass. This wakes a settled agent in its existing pane.
   Afterwards, start a new background `wait`:
   ```bash
