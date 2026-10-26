@@ -48,6 +48,7 @@ Claude acts as the orchestrator. It breaks the job into focused subtasks and spa
 | `/claude-cowboy model <alias>` | Set the default agent model (`haiku`, `sonnet`, `opus`, `fable` or a full ID; `clear` resets it) |
 | `/claude-cowboy templates` | List agent and orchestrator templates |
 | `/claude-cowboy config` | Show the current config |
+| `/claude-cowboy diff <id>` | Show an agent's commits and uncommitted changes |
 | `/claude-cowboy <anything else>` | Treat it as a job to break down and delegate |
 
 You can also just ask in plain language, e.g. "spin up cowboy agents to migrate these three services in parallel".
@@ -93,3 +94,7 @@ See [`SKILL.md`](SKILL.md) for the full reference, including every config key.
 - Spawned agents run with permission checks **bypassed by default** (`agent.permission_mode = bypass`, matching pi-cowboy). Change it with `cowboy config --set agent.permission_mode=<mode>`.
 - State lives in `$CLAUDE_COWBOY_HOME` (default `~/.claude/claude-cowboy`).
 - Agent templates live in `agents/`, orchestrator templates in `orchestrators/`.
+- To coordinate agents on several machines from one session, see [claude-space-cowboy](https://github.com/nicklausroach/claude-space-cowboy). It runs this helper on each machine over SSH, with these environment variables:
+  - `CLAUDE_COWBOY_COORDINATED=1`: allow commands outside a Herdr pane, as long as a Herdr server is running on the machine.
+  - `CLAUDE_COWBOY_HERDR_SESSION=<name>`: the Herdr session to use (default: `default`).
+  - `HERDR_BIN=<path>`: the herdr binary, if it is not on `PATH` (`~/.local/bin/herdr` is also tried).

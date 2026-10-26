@@ -41,6 +41,22 @@ HARNESSES = ("claude", "codex", "pi", "opencode")
 ACTIVE = ("running", "blocked")
 SETTLED = ("settled", "blocked", "stopped", "exited")
 POLL = 4
+# Set by claude-space-cowboy when it drives this helper over SSH from another machine.
+# There is no Herdr pane then, so herdr is reached through the server's socket instead.
+COORDINATED = os.environ.get("CLAUDE_COWBOY_COORDINATED") == "1"
+
+
+def _herdr_cmd():
+    """herdr binary (+ --session) to call. A non-interactive SSH shell may not have
+    ~/.local/bin (where `herdr machine add` installs it) on PATH."""
+    exe = os.environ.get("HERDR_BIN") or shutil.which("herdr")
+    if not exe and (Path.home() / ".local" / "bin" / "herdr").exists():
+        exe = str(Path.home() / ".local" / "bin" / "herdr")
+    session = os.environ.get("CLAUDE_COWBOY_HERDR_SESSION")
+    return [exe or "herdr", *(["--session", session] if session and session != "default" else [])]
+
+
+HERDR = _herdr_cmd()
 
 DEFAULT_CONFIG = {
     "concurrency": {"default": 4, "harnesses": {}, "models": {}},
@@ -90,7 +106,7 @@ def git(args, cwd, check=True):
 
 
 def herdr(args, check=True):
-    p = run(["herdr", *args], check=False)
+    p = run([*HERDR, *args], check=False)
     if check and p.returncode != 0:
         raise CowboyError(f"herdr {' '.join(args[:3])} failed: {(p.stderr or p.stdout).strip()[:400]}")
     try:
@@ -164,17 +180,27 @@ def agent_dir(agent):
 
 
 def repo_root(path):
+    path = os.path.expanduser(path)  # --repo ~/x arrives unexpanded when quoted over SSH
     p = git(["rev-parse", "--show-toplevel"], cwd=path, check=False)
     if p.returncode != 0:
         raise CowboyError(f"{path} is not inside a git repository")
     return p.stdout.strip()
 
 
+def in_herdr():
+    return os.environ.get("HERDR_ENV") == "1" or COORDINATED
+
+
 def require_herdr():
-    if os.environ.get("HERDR_ENV") != "1":
+    if not in_herdr():
         raise CowboyError("not running inside a Herdr pane (HERDR_ENV != 1); start Claude Code inside Herdr first")
-    if not shutil.which("herdr"):
-        raise CowboyError("herdr is not on PATH")
+    if not shutil.which(HERDR[0]):
+        raise CowboyError("herdr is not on PATH (set HERDR_BIN to its full path)")
+    if COORDINATED:
+        p = run([*HERDR, "status", "server"], check=False)
+        if "status: running" not in p.stdout:
+            raise CowboyError(f"no Herdr server is running on this machine ({p.stdout.strip()[:200]}); "
+                              f"connect to it from Herdr once to start it")
 
 
 # ---------------------------------------------------------------- templates
@@ -338,7 +364,7 @@ def answer_trust_dialog(agent, cfg):
     if "trust this folder" not in pane_tail(agent, 60):
         return False
     herdr(["agent", "send-keys", agent["herdr_name"], "down", "enter"], check=False)
-    r = run(["herdr", "agent", "wait", agent["herdr_name"], "--until", "idle", "--timeout", "30000"], check=False)
+    r = run([*HERDR, "agent", "wait", agent["herdr_name"], "--until", "idle", "--timeout", "30000"], check=False)
     return r.returncode == 0 and "trust this folder" not in pane_tail(agent, 15)
 
 
@@ -352,7 +378,7 @@ def launch(agent, cfg):
     # `worktree open` registers the workspace as a linked worktree of the main repo, so
     # Herdr groups it with the repo's primary workspace (and `close --group` covers it).
     label = f"🐄 {agent['task_name']} ({agent['id']})"
-    r = run(["herdr", "worktree", "open", "--cwd", agent["repo"], "--path", agent["worktree"],
+    r = run([*HERDR, "worktree", "open", "--cwd", agent["repo"], "--path", agent["worktree"],
              "--label", label, "--no-focus"], check=False)
     try:
         ws = json.loads(r.stdout)["result"]
@@ -369,7 +395,7 @@ def launch(agent, cfg):
     args = harness_args(agent, cfg, template, sysprompt_file)
     last = None
     for _ in range(5):  # the new shell may need a moment to reach its prompt
-        p = run(["herdr", "agent", "start", agent["herdr_name"], "--kind", agent["harness"],
+        p = run([*HERDR, "agent", "start", agent["herdr_name"], "--kind", agent["harness"],
                  "--pane", agent["pane_id"], "--timeout", "60000", "--", *args], check=False)
         if p.returncode == 0:
             break
@@ -497,7 +523,7 @@ def herdr_state(agent):
 def pane_tail(agent, lines=40):
     if not agent.get("pane_id"):
         return ""
-    p = run(["herdr", "pane", "read", agent["pane_id"], "--source", "recent-unwrapped",
+    p = run([*HERDR, "pane", "read", agent["pane_id"], "--source", "recent-unwrapped",
              "--lines", str(lines)], check=False)
     try:
         r = json.loads(p.stdout)["result"]
@@ -603,7 +629,7 @@ def cmd_wait(args):
 
 def cmd_status(args):
     cfg = load_config()
-    if not args.no_pump and os.environ.get("HERDR_ENV") == "1":
+    if not args.no_pump and in_herdr():
         pump(cfg)
     agents = [a for a in all_agents() if args.all or a["status"] != "cleaned"]
     for a in agents:
@@ -645,7 +671,7 @@ def cmd_steer(args):
         msg = f"{args.message.strip()}\n\n(When done: commit, then write your report to {a['report']} again.)"
         if not a.get("prompted"):  # blocked at startup: the task itself was never delivered
             msg = f"{task_message(a, agent_dir(a) / 'system.md')}\n\n{args.message.strip()}"
-        r = run(["herdr", "agent", "prompt", a["herdr_name"], msg], check=False)
+        r = run([*HERDR, "agent", "prompt", a["herdr_name"], msg], check=False)
         if r.returncode != 0:
             print(f"✗ {i}: {(r.stderr or r.stdout).strip()[:300]}")
             continue
@@ -710,7 +736,7 @@ def cmd_cleanup(args):
             continue
         out = [f"agent status: {a['status']}"]
         if a.get("workspace_id"):
-            r = run(["herdr", "workspace", "close", a["workspace_id"]], check=False)
+            r = run([*HERDR, "workspace", "close", a["workspace_id"]], check=False)
             out.append("pane: closed" if r.returncode == 0 else f"pane: {(r.stderr or r.stdout).strip()[:120] or 'already gone'}")
         wt_kept = False
         if Path(a["worktree"]).exists():
@@ -744,7 +770,7 @@ def cmd_cleanup(args):
             a["status"] = "cleaned"
             save(a)
         print(f"✓ Cleaned up agent {i}:\n  " + "\n  ".join(out))
-    if os.environ.get("HERDR_ENV") == "1":
+    if in_herdr():
         pump()
 
 
@@ -756,6 +782,17 @@ def cmd_worktree(args):
     path = WORKTREES / branch
     mode = materialize_worktree(repo, branch, path, base, cfg["agent"]["worktree_materialization"], args.include_dirty)
     print(f"✓ Created worktree {path} on branch {branch} from {base} ({mode})")
+
+
+def cmd_diff(args):
+    """Read-only review: the agent's commits since its base, plus any uncommitted changes."""
+    a = load(args.id)
+    log = git(["log", "--stat" if args.stat else "-p", f"{a['base']}..{a['branch']}"], a["repo"], check=False)
+    print(log.stdout.rstrip() or f"(no commits on {a['branch']} since {a['base']})")
+    if Path(a["worktree"]).exists():
+        dirty = git(["diff", "--stat" if args.stat else "HEAD"], a["worktree"], check=False).stdout.rstrip()
+        if dirty:
+            print(f"\n# Uncommitted changes in {a['worktree']}\n{dirty}")
 
 
 def cmd_templates(args):
@@ -820,6 +857,11 @@ def main():
     s.add_argument("--all", action="store_true", help="include cleaned-up agents")
     s.add_argument("--no-pump", action="store_true")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("diff", help="show an agent's commits and uncommitted changes (read-only)")
+    s.add_argument("id")
+    s.add_argument("--stat", action="store_true", help="summary only")
+    s.set_defaults(fn=cmd_diff)
 
     s = sub.add_parser("steer", help="send a follow-up message (revives settled agents)")
     s.add_argument("ids", nargs="+")
