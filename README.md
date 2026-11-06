@@ -11,7 +11,7 @@ See [`SKILL.md`](SKILL.md) for full usage.
 ## Requirements
 
 - Claude Code
-- Herdr (the skill must run inside a Herdr pane, `HERDR_ENV=1`)
+- Herdr: either the terminal app (run inside a Herdr pane, `HERDR_ENV=1`) or the desktop app (run in one of its terminals, `HC_TERMINAL_ID` set; agents open as `🐄` tabs in a per-repo space)
 - Git, Python 3
 - Optional harnesses: `codex`, `pi`, `opencode`
 
@@ -29,7 +29,7 @@ The skill calls its helper by the literal path `~/.claude/skills/claude-cowboy/s
 
 ## Usage
 
-Start Claude Code inside a Herdr pane, in a Git repo, and hand it a job:
+Start Claude Code inside Herdr (a terminal-app pane or a desktop-app terminal), in a Git repo, and hand it a job:
 
 ```
 /claude-cowboy add input validation to every API handler, and write tests for each
@@ -95,9 +95,11 @@ See [`SKILL.md`](SKILL.md) for the full reference, including every config key.
 - State lives in `$CLAUDE_COWBOY_HOME` (default `~/.claude/claude-cowboy`).
 - Agent templates live in `agents/`, orchestrator templates in `orchestrators/`.
 - To coordinate agents on several machines from one session, see [claude-space-cowboy](https://github.com/nicklausroach/claude-space-cowboy). It runs this helper on each machine over SSH, with these environment variables:
-  - `CLAUDE_COWBOY_COORDINATED=1`: allow commands outside a Herdr pane, as long as a Herdr server is running on the machine.
+  - `CLAUDE_COWBOY_COORDINATED=1`: allow commands outside a Herdr pane, as long as a Herdr server (or, with the desktop app, herdr-core) is running on the machine.
+  - `CLAUDE_COWBOY_BACKEND=herdr|hc`: which Herdr to drive (default: detected from `HERDR_ENV` / `HC_TERMINAL_ID`).
+  - `CLAUDE_COWBOY_HC_SPACE=<space id>`: desktop app only, the window space agents open in (a remote machine has no window to ask).
   - `CLAUDE_COWBOY_HERDR_SESSION=<name>`: the Herdr session to use (default: `default`).
-  - `HERDR_BIN=<path>`: the herdr binary, if it is not on `PATH` (`~/.local/bin/herdr` is also tried).
+  - `HERDR_BIN=<path>`: the herdr binary, if it is not on `PATH` (`~/.local/bin/herdr` is also tried). `HC_BIN` and `HERDR_APP_BIN` do the same for `hc` and `herdr-app`.
 
 ## Tests
 

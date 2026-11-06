@@ -232,5 +232,177 @@ class CowboyTest(unittest.TestCase):
         self.assertEqual(Path(self.cb.load(a["id"])["report"]).name, "report.turn2.md")
 
 
+class BackendDetectionTest(unittest.TestCase):
+    def backend(self, env):
+        keep = {k: v for k, v in os.environ.items()
+                if k not in ("HERDR_ENV", "HC_TERMINAL_ID", "CLAUDE_COWBOY_BACKEND")}
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {**keep, **env}, clear=True):
+            return load_cowboy(home).BACKEND
+
+    def test_detection(self):
+        self.assertEqual(self.backend({}), "herdr")
+        self.assertEqual(self.backend({"HERDR_ENV": "1"}), "herdr")
+        self.assertEqual(self.backend({"HC_TERMINAL_ID": "t4"}), "hc")
+        # terminal Herdr nested in a desktop-app pane: the inner one is what the user sees
+        self.assertEqual(self.backend({"HC_TERMINAL_ID": "t4", "HERDR_ENV": "1"}), "herdr")
+        self.assertEqual(self.backend({"HERDR_ENV": "1", "CLAUDE_COWBOY_BACKEND": "hc"}), "hc")
+
+
+class HcBackendTest(unittest.TestCase):
+    """The desktop-app (herdr-core) backend, against a scripted fake `hc` / `herdr-app`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cb = load_cowboy(self.tmp.name)
+        self.cb.BACKEND = "hc"
+        self.cfg = self.cb.load_config()
+        self.calls = []
+        self.status = {"state": "working"}  # what `hc get` reports
+        self.screen = ""
+        self.finished = False
+        self.now = 1_000_000.0
+        patches = [
+            mock.patch.object(self.cb, "run", self.fake_run),
+            mock.patch.object(self.cb.shutil, "which", lambda name: "/bin/" + name),
+            mock.patch.object(self.cb.time, "time", lambda: self.now),
+            mock.patch.object(self.cb.time, "sleep", self.fake_sleep),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def fake_sleep(self, secs):
+        self.now += secs
+
+    def fake_run(self, cmd, cwd=None, check=True, input=None):
+        cmd = [str(c) for c in cmd]
+        self.calls.append(cmd)
+        tool, sub = Path(cmd[0]).name, cmd[1]
+        out, rc = "", 0
+        if tool == "herdr-app" and sub == "ls":
+            out = json.dumps({"spaces": [{"id": "sp1", "name": "🐄 repo", "tabs": [
+                {"id": "tb1", "name": "shell", "terminals": [{"terminal": "t5"}]},
+                {"id": "tb2", "name": "2", "terminals": [{"terminal": "t9"}]}]}]})
+        elif tool == "herdr-app" and sub == "do":
+            out = json.dumps({"space": "sp1", "tab": "tb1", "terminal": "t5"} if cmd[2] == "space.new" else {"ok": True})
+        elif sub == "run":
+            out = json.dumps({"address": "t9", "name": cmd[cmd.index("--name") + 1], "state": "live"})
+        elif sub == "get":
+            out = json.dumps({"state": "finished" if self.finished else "live", "status": self.status})
+        elif sub == "read":
+            out = self.screen
+        elif sub == "keys":
+            self.screen = ""
+            self.status = {"state": "working"}
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+
+    def hc_calls(self, sub):
+        return [c for c in self.calls if Path(c[0]).name == "hc" and c[1] == sub]
+
+    def make_agent(self, harness="claude", **over):
+        agent = {
+            "id": "abcd1234", "task_name": "fix it", "branch": "cow-fix-it-abcd1234",
+            "worktree": self.tmp.name, "repo": self.tmp.name, "base": "main", "harness": harness,
+            "template": None, "status": "queued", "created_at": self.now, "turn": 1,
+        }
+        d = self.cb.agent_dir(agent)
+        agent["prompt_file"] = str(d / "prompt.md")
+        agent["report"] = str(d / "report.md")
+        agent.update(over)
+        Path(agent["prompt_file"]).write_text("do the thing")
+        self.cb.save(agent)
+        return agent
+
+    def test_launch_claude_into_repo_space(self):
+        a = self.cb.launch(self.make_agent(), self.cfg)
+        self.assertEqual(a["status"], "running")
+        self.assertEqual((a["backend"], a["hc_address"], a["space_id"], a["tab_id"]), ("hc", "t9", "sp1", "tb2"))
+        run = self.hc_calls("run")[0]
+        self.assertEqual(run[2], "--json")  # before `--`, so hc parses it
+        for flag in ("--bg", "--outlive-parent", "--no-notify"):
+            self.assertIn(flag, run)
+        self.assertIn("herdr.space=sp1", run)
+        self.assertIn("cowboy.id=abcd1234", run)
+        argv = run[run.index("--") + 1:]
+        self.assertEqual(argv[0], "claude")
+        self.assertIn("do the thing", argv[-1])  # task on the command line
+        self.assertEqual(self.hc_calls("send"), [])
+        renames = [c for c in self.calls if c[1:3] == ["do", "tab.rename"]]
+        self.assertEqual(json.loads(renames[0][3]), {"id": "tb2", "name": "🐄 fix it (abcd1234)"})
+        self.assertEqual(json.loads((Path(self.tmp.name) / "hc-spaces.json").read_text()), {self.tmp.name: "sp1"})
+
+    def test_existing_space_is_reused(self):
+        (Path(self.tmp.name) / "hc-spaces.json").write_text(json.dumps({self.tmp.name: "sp1"}))
+        self.cb.launch(self.make_agent(), self.cfg)
+        self.assertFalse([c for c in self.calls if c[1:3] == ["do", "space.new"]])
+
+    def test_trust_dialog_accepted_when_repo_trusted(self):
+        self.status, self.screen = None, "Do you trust this folder?"
+        with mock.patch.object(self.cb, "repo_is_trusted", lambda repo: True):
+            a = self.cb.launch(self.make_agent(), self.cfg)
+        self.assertEqual(a["status"], "running")
+        self.assertEqual(self.hc_calls("keys")[0][-2:], ["down", "enter"])
+
+    def test_trust_dialog_left_for_user(self):
+        self.status, self.screen = None, "Do you trust this folder?"
+        with mock.patch.object(self.cb, "repo_is_trusted", lambda repo: False):
+            a = self.cb.launch(self.make_agent(), self.cfg)
+        self.assertEqual(a["status"], "blocked")
+        self.assertTrue(a["prompted"])  # claude's task is already in its argv
+        self.assertIn("🐄 fix it (abcd1234)", a["note"])
+        self.assertEqual(self.hc_calls("keys"), [])
+
+    def test_other_harness_gets_task_typed_in(self):
+        self.status = {"state": "idle"}
+        a = self.cb.launch(self.make_agent(harness="codex"), self.cfg)
+        self.assertEqual(a["status"], "running")
+        self.assertTrue(a["prompted"])
+        send = self.hc_calls("send")[0]
+        self.assertEqual(send[2], "t9")
+        self.assertIn("do the thing", send[3])
+        self.assertNotIn("do the thing", " ".join(self.hc_calls("run")[0]))
+
+    def test_no_window_runs_hidden(self):
+        with mock.patch.object(self.cb, "app_layout", lambda: None):
+            a = self.cb.launch(self.make_agent(), self.cfg)
+        self.assertEqual(a["status"], "running")
+        self.assertIsNone(a["space_id"])
+        self.assertFalse([x for x in self.hc_calls("run")[0] if x.startswith("herdr.space=")])
+
+    def test_coordinated_uses_given_space(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_COWBOY_HC_SPACE": "spRemote"}):
+            self.cb.launch(self.make_agent(), self.cfg)
+        self.assertIn("herdr.space=spRemote", self.hc_calls("run")[0])
+        self.assertFalse([c for c in self.calls if c[1:3] == ["do", "space.new"]])
+
+    def test_queued_agent_keeps_its_space(self):
+        # Spawned with a space but started later by a pump that has no CLAUDE_COWBOY_HC_SPACE.
+        self.cb.launch(self.make_agent(hc_space="spRemote"), self.cfg)
+        self.assertIn("herdr.space=spRemote", self.hc_calls("run")[0])
+
+    def test_state_mapping(self):
+        a = self.make_agent(backend="hc", hc_address="t9", status="running")
+        for status, want in (({"state": "idle"}, "idle"), ({"state": "done"}, "done"),
+                             ({"state": "error"}, "blocked"), (None, "starting")):
+            self.status = status
+            self.assertEqual(self.cb.herdr_state(a), want)
+        self.finished = True
+        self.assertEqual(self.cb.herdr_state(a), "gone")
+
+    def test_steer_stop_cleanup(self):
+        a = self.make_agent(backend="hc", hc_address="t9", status="settled", prompted=True, herdr_name="cow-abcd1234")
+        with redirect_stdout(io.StringIO()):
+            self.cb.cmd_steer(argparse.Namespace(ids=[a["id"]], message="one more thing"))
+            self.assertEqual(self.hc_calls("send")[0][2:3], ["t9"])
+            self.assertIn("one more thing", self.hc_calls("send")[0][3])
+            self.cb.cmd_stop(argparse.Namespace(ids=[a["id"]]))
+            self.assertEqual(self.hc_calls("interrupt")[0][2], "t9")
+            with mock.patch.object(self.cb, "git", lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")):
+                self.cb.cmd_cleanup(argparse.Namespace(ids=[a["id"]], force=True, delete_unmerged=False))
+        self.assertEqual(self.hc_calls("kill")[0][2], "t9")
+        self.assertEqual(self.hc_calls("rm")[0][2], "t9")
+
+
 if __name__ == "__main__":
     unittest.main()

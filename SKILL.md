@@ -1,6 +1,6 @@
 ---
 name: claude-cowboy
-description: "Multi-agent orchestrator (a Claude Code port of pi-cowboy): split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode), each running in its own Herdr workspace and isolated in a copy-on-write Git worktree on its own branch; then steer them and, when the user says so, open PRs, merge and clean up. Use when the user invokes /claude-cowboy, asks for cowboy agents, or asks to launch parallel background agents in Herdr worktrees. Requires running inside Herdr (HERDR_ENV=1) in a Git repo."
+description: "Multi-agent orchestrator (a Claude Code port of pi-cowboy): split a large job into focused subtasks and delegate them to background coding agents (Claude Code, Codex, pi, OpenCode), each running in its own Herdr workspace and isolated in a copy-on-write Git worktree on its own branch; then steer them and, when the user says so, open PRs, merge and clean up. Use when the user invokes /claude-cowboy, asks for cowboy agents, or asks to launch parallel background agents in Herdr worktrees. Requires running inside Herdr (the terminal app, HERDR_ENV=1, or the desktop app, HC_TERMINAL_ID set) in a Git repo."
 ---
 
 # claude-cowboy
@@ -18,14 +18,20 @@ user's permission allow-rule for it matches.
 Check these first. If one fails, tell the user and stop.
 
 ```bash
-test "${HERDR_ENV:-}" = 1 && git rev-parse --show-toplevel
+{ test "${HERDR_ENV:-}" = 1 || test -n "${HC_TERMINAL_ID:-}"; } && git rev-parse --show-toplevel
 ```
 
-- You must be inside a Herdr pane. Agents get their own Herdr workspaces, and the user
-  can open any of them to watch or steer. Agent workspaces are opened with
-  `herdr worktree open`, so Herdr records each one as a linked worktree of the main repo
-  and groups it with the repo's workspace. `herdr worktree list --cwd <repo>` shows which
-  workspace each agent branch is open in.
+- You must be inside Herdr: a pane of the terminal app (`HERDR_ENV=1`) or a terminal of
+  the desktop app (`HC_TERMINAL_ID` set). The helper picks the matching backend itself;
+  if both are set (terminal Herdr nested in the desktop app) the terminal app wins.
+  Every agent gets its own place the user can open to watch or steer:
+  - **Terminal app:** a Herdr workspace opened with `herdr worktree open`, so Herdr records
+    it as a linked worktree of the main repo and groups it with the repo's workspace.
+    `herdr worktree list --cwd <repo>` shows which workspace each agent branch is open in.
+  - **Desktop app:** a herdr-core terminal (`hc`), shown as a tab named
+    `🐄 <task> (<id>)` in a `🐄 <repo>` space (created on first use; its first tab is a
+    plain `shell`). Agents outlive this session and don't type notes into it;
+    `cowboy wait` reports as usual. `hc ls --label cowboy.id=<id>` finds one.
 - You must be inside a Git repo. Agents branch from its current branch by default.
 - Worktrees are copy-on-write clones (APFS `cp -c`, Linux `cp --reflink`), so ignored
   files like `node_modules` and build caches come along almost free. If cloning fails,
@@ -207,6 +213,6 @@ template's `model`, then `agent.model`, then the harness's own default.
   A good review is not permission to land the work.
 - Read reports critically and check the diff before merging. A report is the agent's
   claim, not proof.
-- Never close Herdr workspaces you didn't create. Cleanup closes only the agent's own.
+- Never close Herdr workspaces, spaces, tabs or terminals you didn't create. Cleanup closes only the agent's own.
 - Agents run with permission checks bypassed by default (as in pi-cowboy). Mention this
   the first time you spawn agents for a user.

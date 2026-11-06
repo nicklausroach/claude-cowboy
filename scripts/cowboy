@@ -58,6 +58,39 @@ def _herdr_cmd():
 
 HERDR = _herdr_cmd()
 
+
+def _bin(env, name):
+    exe = os.environ.get(env) or shutil.which(name)
+    if not exe and (Path.home() / ".local" / "bin" / name).exists():
+        exe = str(Path.home() / ".local" / "bin" / name)
+    return exe or name
+
+
+# The Herdr desktop app runs terminals in herdr-core, driven by `hc`; `herdr-app` only
+# arranges the window (spaces > tabs > panes). The terminal app is the older `herdr`.
+HC = [_bin("HC_BIN", "hc")]
+HERDR_APP = [_bin("HERDR_APP_BIN", "herdr-app")]
+
+
+def _backend():
+    """"herdr" (terminal app) or "hc" (desktop app). An inner terminal Herdr wins over an
+    outer desktop app, since that is the session the user is looking at."""
+    forced = os.environ.get("CLAUDE_COWBOY_BACKEND")
+    if forced in ("herdr", "hc"):
+        return forced
+    if os.environ.get("HERDR_ENV") == "1":
+        return "herdr"
+    if os.environ.get("HC_TERMINAL_ID"):
+        return "hc"
+    return "herdr"
+
+
+BACKEND = _backend()
+
+
+def backend_of(agent):
+    return agent.get("backend", "herdr")  # agents saved before hc support used herdr
+
 DEFAULT_CONFIG = {
     "concurrency": {"default": 4, "harnesses": {}, "models": {}},
     "agent": {
@@ -113,6 +146,84 @@ def herdr(args, check=True):
         return json.loads(p.stdout) if p.stdout.strip() else {}
     except json.JSONDecodeError:
         return {"raw": p.stdout, "returncode": p.returncode, "stderr": p.stderr}
+
+
+def hc(sub, args=(), check=True):
+    """Run `hc <sub> --json <args>` and parse its JSON. --json goes right after the
+    subcommand so it can't land after a `--` that ends hc's own options."""
+    p = run([*HC, sub, "--json", *args], check=False)
+    try:
+        out = json.loads(p.stdout) if p.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"error": {"kind": "bad_output", "message": p.stdout.strip()[:300]}}
+    if p.returncode != 0 and "error" not in out:
+        out = {"error": {"kind": "failed", "message": (p.stderr or p.stdout).strip()[:300]}}
+    if check and "error" in out:
+        raise CowboyError(f"hc {sub} failed: {out['error'].get('message')}")
+    return out
+
+
+def app(cmd, **kw):
+    """`herdr-app do <cmd>`; None when the window isn't running or the command failed."""
+    if not shutil.which(HERDR_APP[0]):
+        return None
+    p = run([*HERDR_APP, "do", cmd, json.dumps(kw)], check=False)
+    try:
+        out = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+    return None if p.returncode != 0 or (isinstance(out, dict) and "error" in out) else out
+
+
+def app_layout():
+    if not shutil.which(HERDR_APP[0]):
+        return None
+    p = run([*HERDR_APP, "ls"], check=False)
+    try:
+        return json.loads(p.stdout) if p.returncode == 0 else None
+    except json.JSONDecodeError:
+        return None
+
+
+def hc_space(repo, given=None):
+    """The desktop-app space cowboy agents of `repo` open in: one "🐄 <repo>" space per
+    repo, created on first use. space-cowboy passes CLAUDE_COWBOY_HC_SPACE for remote
+    machines, where there is no window to ask; spawn saves it as the agent's `hc_space`
+    so an agent that waits in the queue still opens there. None: run without a tab."""
+    if given or os.environ.get("CLAUDE_COWBOY_HC_SPACE"):
+        return given or os.environ["CLAUDE_COWBOY_HC_SPACE"]
+    layout = None if COORDINATED else app_layout()
+    if layout is None:
+        return None
+    ids = {s["id"] for s in layout.get("spaces", [])}
+    cache_file = HOME / "hc-spaces.json"
+    try:
+        cache = json.loads(cache_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    if cache.get(repo) in ids:
+        return cache[repo]
+    made = app("space.new", name=f"🐄 {os.path.basename(repo)}", folder=repo, tab="shell")
+    if not made or not made.get("space"):
+        return None
+    cache[repo] = made["space"]
+    HOME.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(cache, indent=2) + "\n")
+    return made["space"]
+
+
+def name_tab(address, label, tries=6):
+    """Give an hc terminal's tab a readable name. The window adds the tab a moment after
+    the terminal starts, so look a few times. Returns the tab id or None."""
+    for n in range(tries):
+        for s in (app_layout() or {}).get("spaces", []):
+            for t in s.get("tabs", []):
+                if any(x.get("terminal") == address for x in t.get("terminals", [])):
+                    app("tab.rename", id=t["id"], name=label)
+                    return t["id"]
+        if n < tries - 1:
+            time.sleep(0.5)
+    return None
 
 
 def deep_merge(base, over):
@@ -188,12 +299,20 @@ def repo_root(path):
 
 
 def in_herdr():
-    return os.environ.get("HERDR_ENV") == "1" or COORDINATED
+    return os.environ.get("HERDR_ENV") == "1" or bool(os.environ.get("HC_TERMINAL_ID")) or COORDINATED
 
 
 def require_herdr():
     if not in_herdr():
-        raise CowboyError("not running inside a Herdr pane (HERDR_ENV != 1); start Claude Code inside Herdr first")
+        raise CowboyError("not running inside Herdr (neither HERDR_ENV=1 nor HC_TERMINAL_ID is set); "
+                          "start Claude Code inside Herdr first")
+    if BACKEND == "hc":
+        if not shutil.which(HC[0]):
+            raise CowboyError("hc is not on PATH (set HC_BIN to its full path)")
+        if COORDINATED and run([*HC, "server", "status", "--json"], check=False).returncode != 0:
+            raise CowboyError("no herdr-core is running on this machine; add it in the Herdr app "
+                              "(hc machine add) or run `hc server start` there")
+        return
     if not shutil.which(HERDR[0]):
         raise CowboyError("herdr is not on PATH (set HERDR_BIN to its full path)")
     if COORDINATED:
@@ -364,9 +483,74 @@ def answer_trust_dialog(agent, cfg):
         return False
     if "trust this folder" not in pane_tail(agent, 60):
         return False
+    if backend_of(agent) == "hc":
+        run([*HC, "keys", agent["hc_address"], "down", "enter"], check=False)
+        run([*HC, "wait", agent["hc_address"], "--timeout", "30"], check=False)
+        return "trust this folder" not in pane_tail(agent, 15)
     herdr(["agent", "send-keys", agent["herdr_name"], "down", "enter"], check=False)
     r = run([*HERDR, "agent", "wait", agent["herdr_name"], "--until", "idle", "--timeout", "30000"], check=False)
     return r.returncode == 0 and "trust this folder" not in pane_tail(agent, 15)
+
+
+def launch_hc(agent, cfg, template, sysprompt_file, label):
+    """Desktop app: run the agent in a herdr-core terminal, shown as a tab of the repo's
+    space. Claude gets its task on the command line, which it keeps through the
+    folder-trust dialog; other harnesses get it typed in once they are ready."""
+    space = hc_space(agent["repo"], agent.get("hc_space"))
+    first = task_message(agent, sysprompt_file) if agent["harness"] == "claude" else None
+    argv = [agent["harness"], *harness_args(agent, cfg, template, sysprompt_file), *([first] if first else [])]
+    labels = [f"cowboy.id={agent['id']}", *([f"herdr.space={space}"] if space else [])]
+    r = hc("run", ["--bg", "--name", agent["herdr_name"], "--cwd", agent["worktree"],
+                   # Outlive the orchestrator's session (hc ends children with their parent by
+                   # default) and keep turn notes out of its input: `cowboy wait` reports instead.
+                   "--outlive-parent", "--no-notify",
+                   *[x for lb in labels for x in ("--label", lb)], "--", *argv], check=False)
+    if "error" in r or not r.get("address"):
+        agent["status"] = "exited"
+        agent["note"] = f"agent failed to start: {(r.get('error') or {}).get('message') or r}"[:300]
+        save(agent)
+        return agent
+    agent["hc_address"] = r["address"]
+    agent["space_id"] = space
+    agent["tab_id"] = name_tab(r["address"], label) if space else None
+    agent["prompted"] = first is not None
+    save(agent)
+
+    where = f"the Herdr tab \"{label}\"" if space else f"hc terminal {r['address']} (`hc attach {r['address']}`)"
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        st = herdr_state(agent)
+        if st == "gone":
+            agent["status"] = "exited"
+            agent["note"] = f"agent exited at startup; see `hc read {r['address']}`"
+            save(agent)
+            return agent
+        if st not in (None, "starting"):
+            break  # it reports status, so it got past any startup dialog
+        if "trust this folder" in pane_tail(agent, 60):
+            if answer_trust_dialog(agent, cfg):
+                break
+            agent["status"] = "blocked"
+            agent["note"] = (f"agent is blocked at startup (folder-trust dialog); answer it in {where}"
+                             + (", and it starts its task by itself" if first else
+                                f", then `cowboy steer {agent['id']} -m go`"))
+            save(agent)
+            return agent
+        time.sleep(2)
+
+    if first is None:
+        p = run([*HC, "send", agent["hc_address"], task_message(agent, sysprompt_file)], check=False)
+        if p.returncode != 0:
+            agent["status"] = "blocked"
+            agent["note"] = (f"could not deliver the task ({(p.stderr or p.stdout).strip()[:150]}); check "
+                             f"{where}, then `cowboy steer {agent['id']} -m go`")
+            save(agent)
+            return agent
+        agent["prompted"] = True
+    agent["status"] = "running"
+    agent["started_at"] = time.time()
+    save(agent)
+    return agent
 
 
 def launch(agent, cfg):
@@ -376,9 +560,14 @@ def launch(agent, cfg):
     sysprompt_file = d / "system.md"
     sysprompt_file.write_text(build_system_prompt(agent, template, orchestrator))
 
+    label = f"🐄 {agent['task_name']} ({agent['id']})"
+    agent["herdr_name"] = f"cow-{agent['id']}"
+    agent["backend"] = BACKEND
+    if BACKEND == "hc":
+        return launch_hc(agent, cfg, template, sysprompt_file, label)
+
     # `worktree open` registers the workspace as a linked worktree of the main repo, so
     # Herdr groups it with the repo's primary workspace (and `close --group` covers it).
-    label = f"🐄 {agent['task_name']} ({agent['id']})"
     r = run([*HERDR, "worktree", "open", "--cwd", agent["repo"], "--path", agent["worktree"],
              "--label", label, "--no-focus"], check=False)
     try:
@@ -390,7 +579,6 @@ def launch(agent, cfg):
         ws = herdr(["workspace", "create", "--cwd", agent["worktree"], "--label", label, "--no-focus"])["result"]
     agent["workspace_id"] = ws["workspace"]["workspace_id"]
     agent["pane_id"] = ws["root_pane"]["pane_id"]
-    agent["herdr_name"] = f"cow-{agent['id']}"
     save(agent)
 
     args = harness_args(agent, cfg, template, sysprompt_file)
@@ -492,6 +680,7 @@ def cmd_spawn(args):
         "model": args.model or hcfg.get("model") or template.get("model") or cfg["agent"]["model"],
         "effort": args.effort or hcfg.get("effort") or template.get("effort") or cfg["agent"]["effort"],
         "status": "queued", "materialization": mode, "created_at": time.time(), "turn": 1,
+        "hc_space": os.environ.get("CLAUDE_COWBOY_HC_SPACE") or None,
     }
     d = agent_dir(agent)
     agent["prompt_file"] = str(d / "prompt.md")
@@ -510,7 +699,22 @@ def cmd_spawn(args):
     print(f"  → run `cowboy wait {aid}` in the background to be notified when it settles")
 
 
+def hc_state(agent):
+    """herdr-core status in the words check_settled uses. "starting": the terminal is live
+    but its program hasn't reported a status yet (booting, or at a startup dialog)."""
+    r = hc("get", [agent["hc_address"]], check=False)
+    if "error" in r:
+        return "gone" if r["error"].get("kind") == "not_found" else None
+    if r.get("state") == "finished":
+        return "gone"
+    s = r.get("status")
+    st = s.get("state") if isinstance(s, dict) else s
+    return "blocked" if st == "error" else (st or "starting")  # error also needs a human
+
+
 def herdr_state(agent):
+    if backend_of(agent) == "hc":
+        return hc_state(agent) if agent.get("hc_address") else None
     if not agent.get("herdr_name"):
         return None
     r = herdr(["agent", "get", agent["herdr_name"]], check=False)
@@ -522,6 +726,10 @@ def herdr_state(agent):
 
 
 def pane_tail(agent, lines=40):
+    if backend_of(agent) == "hc":
+        if not agent.get("hc_address"):
+            return ""
+        return run([*HC, "read", agent["hc_address"], "--lines", str(lines)], check=False).stdout[-4000:]
     if not agent.get("pane_id"):
         return ""
     p = run([*HERDR, "pane", "read", agent["pane_id"], "--source", "recent-unwrapped",
@@ -683,7 +891,10 @@ def cmd_steer(args):
             msg = f"{args.message.strip()}\n\n(When done: commit, then write your report for this turn to {a['report']}.)"
         else:  # blocked at startup: the task was never delivered, so this is still turn 1
             msg = f"{task_message(a, agent_dir(a) / 'system.md')}\n\n{args.message.strip()}"
-        r = run([*HERDR, "agent", "prompt", a["herdr_name"], msg], check=False)
+        if backend_of(a) == "hc":
+            r = run([*HC, "send", a["hc_address"], msg], check=False)
+        else:
+            r = run([*HERDR, "agent", "prompt", a["herdr_name"], msg], check=False)
         if r.returncode != 0:
             print(f"✗ {i}: {(r.stderr or r.stdout).strip()[:300]}")
             continue
@@ -703,7 +914,10 @@ def cmd_stop(args):
             save(a)
             print(f"✓ Dequeued {i}")
             continue
-        if a.get("herdr_name") and herdr_state(a) not in (None, "gone"):
+        if backend_of(a) == "hc":
+            if a.get("hc_address") and herdr_state(a) not in (None, "gone"):
+                run([*HC, "interrupt", a["hc_address"]], check=False)
+        elif a.get("herdr_name") and herdr_state(a) not in (None, "gone"):
             herdr(["agent", "send-keys", a["herdr_name"], "esc"], check=False)
             time.sleep(0.5)
             herdr(["agent", "send-keys", a["herdr_name"], "esc"], check=False)
@@ -747,7 +961,13 @@ def cmd_cleanup(args):
             print(f"✗ {i}: agent is {a['status']}; stop it first (`cowboy stop {i}`)")
             continue
         out = [f"agent status: {a['status']}"]
-        if a.get("workspace_id"):
+        if backend_of(a) == "hc" and a.get("hc_address"):
+            # Removing the terminal also takes its tab out of the window.
+            run([*HC, "kill", a["hc_address"]], check=False)
+            r = run([*HC, "rm", a["hc_address"]], check=False)
+            out.append("terminal: closed" if r.returncode == 0 else
+                       f"terminal: {(r.stderr or r.stdout).strip()[:120] or 'already gone'}")
+        elif a.get("workspace_id"):
             r = run([*HERDR, "workspace", "close", a["workspace_id"]], check=False)
             out.append("pane: closed" if r.returncode == 0 else f"pane: {(r.stderr or r.stdout).strip()[:120] or 'already gone'}")
         wt_kept = False
