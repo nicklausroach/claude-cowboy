@@ -325,7 +325,8 @@ class HcBackendTest(unittest.TestCase):
         self.assertIn("herdr.space=sp1", run)
         self.assertIn("cowboy.id=abcd1234", run)
         argv = run[run.index("--") + 1:]
-        self.assertEqual(argv[0], "claude")
+        # Through a login shell, so remote agents get the login PATH and profile env.
+        self.assertEqual(argv[1:5], ["-lc", 'exec "$@"', "cowboy", "claude"])
         self.assertIn("do the thing", argv[-1])  # task on the command line
         self.assertEqual(self.hc_calls("send"), [])
         renames = [c for c in self.calls if c[1:3] == ["do", "tab.rename"]]
