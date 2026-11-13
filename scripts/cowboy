@@ -492,13 +492,23 @@ def answer_trust_dialog(agent, cfg):
     return r.returncode == 0 and "trust this folder" not in pane_tail(agent, 15)
 
 
+def login_shell(argv):
+    """Run argv through the user's login shell, then exec it. herdr-core starts programs
+    with its own environment, which is whatever its starter had: over a non-login SSH (how
+    the desktop app reconnects to a remote) that lacks ~/.local/bin and profile-only vars
+    such as Ona's secrets in /etc/profile.d, so `claude` isn't found or can't sign in.
+    bash and sh read /etc/profile there; zsh reads /etc/zprofile instead."""
+    return [os.environ.get("SHELL") or "/bin/sh", "-lc", 'exec "$@"', "cowboy", *argv]
+
+
 def launch_hc(agent, cfg, template, sysprompt_file, label):
     """Desktop app: run the agent in a herdr-core terminal, shown as a tab of the repo's
     space. Claude gets its task on the command line, which it keeps through the
     folder-trust dialog; other harnesses get it typed in once they are ready."""
     space = hc_space(agent["repo"], agent.get("hc_space"))
     first = task_message(agent, sysprompt_file) if agent["harness"] == "claude" else None
-    argv = [agent["harness"], *harness_args(agent, cfg, template, sysprompt_file), *([first] if first else [])]
+    argv = login_shell([agent["harness"], *harness_args(agent, cfg, template, sysprompt_file),
+                        *([first] if first else [])])
     labels = [f"cowboy.id={agent['id']}", *([f"herdr.space={space}"] if space else [])]
     r = hc("run", ["--bg", "--name", agent["herdr_name"], "--cwd", agent["worktree"],
                    # Outlive the orchestrator's session (hc ends children with their parent by
